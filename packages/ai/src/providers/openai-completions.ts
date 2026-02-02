@@ -103,12 +103,20 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 		try {
 			const apiKey = options?.apiKey || getEnvApiKey(model.provider) || "";
 			const client = createClient(model, context, apiKey, options?.headers);
+			const _compat = getCompat(model);
+			const _isToolsViaPrompt = _compat.toolsViaPrompt && context.tools && context.tools.length > 0;
+			let _viaPromptBuffer = "";
 			const params = buildParams(model, context, options);
 			options?.onPayload?.(params);
 			const openaiStream = await client.chat.completions.create(params, { signal: options?.signal });
 			stream.push({ type: "start", partial: output });
 
-			let currentBlock: TextContent | ThinkingContent | (ToolCall & { partialArgs?: string }) | null = null;
+			let currentBlock:
+				| TextContent
+				| ThinkingContent
+				| (ToolCall & { partialArgs?: string; _isTextResponse?: boolean })
+				| null = null;
+			let _suppressToolContent = false;
 			const blocks = output.content;
 			const blockIndex = () => blocks.length - 1;
 			const finishCurrentBlock = (block?: typeof currentBlock) => {
@@ -128,14 +136,27 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 							partial: output,
 						});
 					} else if (block.type === "toolCall") {
-						block.arguments = JSON.parse(block.partialArgs || "{}");
-						delete block.partialArgs;
-						stream.push({
-							type: "toolcall_end",
-							contentIndex: blockIndex(),
-							toolCall: block,
-							partial: output,
-						});
+						if ((block as any)._isTextResponse || block.name === "__text_response") {
+							// Convert __text_response tool call to a text block
+							const args = JSON.parse(block.partialArgs || "{}");
+							const text = args.text || "";
+							const idx = blocks.indexOf(block);
+							const textBlock: TextContent = { type: "text", text };
+							if (idx >= 0) (blocks as any)[idx] = textBlock;
+							const ci = idx >= 0 ? idx : blockIndex();
+							stream.push({ type: "text_start", contentIndex: ci, partial: output });
+							stream.push({ type: "text_delta", contentIndex: ci, delta: text, partial: output });
+							stream.push({ type: "text_end", contentIndex: ci, content: text, partial: output });
+						} else {
+							block.arguments = JSON.parse(block.partialArgs || "{}");
+							delete block.partialArgs;
+							stream.push({
+								type: "toolcall_end",
+								contentIndex: blockIndex(),
+								toolCall: block,
+								partial: output,
+							});
+						}
 					}
 				}
 			};
@@ -174,19 +195,35 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				}
 
 				if (choice.delta) {
+					// Suppress content that contains raw tool call tokens (Foundry Local quirk:
+					// returns <|tool_call|>...<|/tool_call|> in content alongside parsed tool_calls)
+					if (
+						choice.delta.content &&
+						(choice.delta.content.includes("<|tool_call|>") || choice.delta.content.includes("<|/tool_call|>"))
+					) {
+						_suppressToolContent = true;
+					}
+					if (choice.delta.tool_calls && choice.delta.tool_calls.length > 0) {
+						_suppressToolContent = false;
+					}
+
 					if (
 						choice.delta.content !== null &&
 						choice.delta.content !== undefined &&
-						choice.delta.content.length > 0
+						choice.delta.content.length > 0 &&
+						!_suppressToolContent
 					) {
-						if (!currentBlock || currentBlock.type !== "text") {
+						// toolsViaPrompt: buffer content for post-processing instead of emitting
+						if (_isToolsViaPrompt) {
+							_viaPromptBuffer += choice.delta.content;
+						} else if (!currentBlock || currentBlock.type !== "text") {
 							finishCurrentBlock(currentBlock);
 							currentBlock = { type: "text", text: "" };
 							output.content.push(currentBlock);
 							stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
 						}
 
-						if (currentBlock.type === "text") {
+						if (!_isToolsViaPrompt && currentBlock?.type === "text") {
 							currentBlock.text += choice.delta.content;
 							stream.push({
 								type: "text_delta",
@@ -248,32 +285,43 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 								(toolCall.id && currentBlock.id !== toolCall.id)
 							) {
 								finishCurrentBlock(currentBlock);
+								const isTextResponse = toolCall.function?.name === "__text_response";
 								currentBlock = {
 									type: "toolCall",
 									id: toolCall.id || "",
 									name: toolCall.function?.name || "",
 									arguments: {},
 									partialArgs: "",
+									_isTextResponse: isTextResponse,
 								};
 								output.content.push(currentBlock);
-								stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+								if (!isTextResponse) {
+									stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+								}
 							}
 
 							if (currentBlock.type === "toolCall") {
 								if (toolCall.id) currentBlock.id = toolCall.id;
-								if (toolCall.function?.name) currentBlock.name = toolCall.function.name;
+								if (toolCall.function?.name) {
+									currentBlock.name = toolCall.function.name;
+									if (toolCall.function.name === "__text_response") {
+										(currentBlock as any)._isTextResponse = true;
+									}
+								}
 								let delta = "";
 								if (toolCall.function?.arguments) {
 									delta = toolCall.function.arguments;
 									currentBlock.partialArgs += toolCall.function.arguments;
 									currentBlock.arguments = parseStreamingJson(currentBlock.partialArgs);
 								}
-								stream.push({
-									type: "toolcall_delta",
-									contentIndex: blockIndex(),
-									delta,
-									partial: output,
-								});
+								if (!(currentBlock as any)._isTextResponse) {
+									stream.push({
+										type: "toolcall_delta",
+										contentIndex: blockIndex(),
+										delta,
+										partial: output,
+									});
+								}
 							}
 						}
 					}
@@ -295,6 +343,191 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 			}
 
 			finishCurrentBlock(currentBlock);
+
+			// toolsViaPrompt: parse buffered content for [TOOL_CALL] markers
+			if (_isToolsViaPrompt && _viaPromptBuffer.length > 0) {
+				const tcMatch = _viaPromptBuffer.match(
+					/\[TOOL_(?:CALL|RESPONSE)\]\s*([\s\S]*?)\s*\[\/TOOL_(?:CALL|RESPONSE)\]/,
+				);
+				if (tcMatch) {
+					try {
+						const parsed = JSON.parse(tcMatch[1]);
+						// Schema-based argument validation: strip invalid/unknown arguments
+						// that the model hallucinates (e.g. exec: env: "normal", workdir: "null")
+						if (parsed.arguments && typeof parsed.arguments === "object" && parsed.name !== "__text_response") {
+							const toolDef = context.tools?.find((t) => t.name === parsed.name);
+							const schemaProps = (toolDef?.parameters as any)?.properties || {};
+							const schemaKeys = Object.keys(schemaProps);
+							for (const key of Object.keys(parsed.arguments)) {
+								const val = parsed.arguments[key];
+								// Strip null/null-string values
+								if (val === "null" || val === null) {
+									delete parsed.arguments[key];
+									continue;
+								}
+								// Strip arguments not in the tool's schema
+								if (schemaKeys.length > 0 && !schemaKeys.includes(key)) {
+									delete parsed.arguments[key];
+									continue;
+								}
+								// Strip type mismatches (e.g. string "normal" for object-type param)
+								const expectedType = schemaProps[key]?.type;
+								if (expectedType && expectedType !== "string" && typeof val === "string") {
+									delete parsed.arguments[key];
+								}
+							}
+						} else if (parsed.arguments && typeof parsed.arguments === "object") {
+							// Strip null/null-string for __text_response too
+							for (const key of Object.keys(parsed.arguments)) {
+								if (parsed.arguments[key] === "null" || parsed.arguments[key] === null) {
+									delete parsed.arguments[key];
+								}
+							}
+						}
+
+						if (parsed.name === "__text_response") {
+							// Convert to text response
+							const text = parsed.arguments?.text || "";
+							const textBlock: TextContent = { type: "text", text };
+							blocks.push(textBlock);
+							stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
+							stream.push({ type: "text_delta", contentIndex: blockIndex(), delta: text, partial: output });
+							stream.push({ type: "text_end", contentIndex: blockIndex(), content: text, partial: output });
+						} else {
+							// Create tool call block
+							const tcId = Math.random().toString(36).slice(2, 11);
+							const toolBlock: ToolCall = {
+								type: "toolCall",
+								id: tcId,
+								name: parsed.name,
+								arguments: parsed.arguments || {},
+							};
+							blocks.push(toolBlock);
+							stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+							stream.push({
+								type: "toolcall_delta",
+								contentIndex: blockIndex(),
+								delta: JSON.stringify(parsed.arguments || {}),
+								partial: output,
+							});
+							stream.push({
+								type: "toolcall_end",
+								contentIndex: blockIndex(),
+								toolCall: toolBlock,
+								partial: output,
+							});
+							output.stopReason = "toolUse";
+						}
+					} catch {
+						// JSON parse failed, strip markers and emit as plain text
+						const cleaned = _viaPromptBuffer.replace(/\[\/?(TOOL_CALL|TOOL_RESULT|TOOL_RESPONSE)\]/g, "").trim();
+						const fallback = cleaned || _viaPromptBuffer;
+						const textBlock: TextContent = { type: "text", text: fallback };
+						blocks.push(textBlock);
+						stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
+						stream.push({ type: "text_delta", contentIndex: blockIndex(), delta: fallback, partial: output });
+						stream.push({ type: "text_end", contentIndex: blockIndex(), content: fallback, partial: output });
+					}
+				} else {
+					// No [TOOL_CALL] markers found — try parsing as bare JSON (model sometimes omits markers)
+					let bareJsonHandled = false;
+					const trimmed = _viaPromptBuffer.trim();
+					if (trimmed.startsWith("{")) {
+						try {
+							const bareJson = JSON.parse(trimmed);
+							if (
+								bareJson.name &&
+								typeof bareJson.name === "string" &&
+								bareJson.arguments &&
+								typeof bareJson.arguments === "object"
+							) {
+								bareJsonHandled = true;
+								// Apply same schema-based validation
+								if (bareJson.name !== "__text_response") {
+									const toolDef = context.tools?.find((t) => t.name === bareJson.name);
+									const schemaProps = (toolDef?.parameters as any)?.properties || {};
+									const schemaKeys = Object.keys(schemaProps);
+									for (const key of Object.keys(bareJson.arguments)) {
+										const val = bareJson.arguments[key];
+										if (val === "null" || val === null) {
+											delete bareJson.arguments[key];
+											continue;
+										}
+										if (schemaKeys.length > 0 && !schemaKeys.includes(key)) {
+											delete bareJson.arguments[key];
+											continue;
+										}
+										const expectedType = schemaProps[key]?.type;
+										if (expectedType && expectedType !== "string" && typeof val === "string") {
+											delete bareJson.arguments[key];
+										}
+									}
+								}
+
+								if (bareJson.name === "__text_response") {
+									const text = bareJson.arguments.text || "";
+									const textBlock: TextContent = { type: "text", text };
+									blocks.push(textBlock);
+									stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
+									stream.push({
+										type: "text_delta",
+										contentIndex: blockIndex(),
+										delta: text,
+										partial: output,
+									});
+									stream.push({
+										type: "text_end",
+										contentIndex: blockIndex(),
+										content: text,
+										partial: output,
+									});
+								} else {
+									const tcId = Math.random().toString(36).slice(2, 11);
+									const toolBlock: ToolCall = {
+										type: "toolCall",
+										id: tcId,
+										name: bareJson.name,
+										arguments: bareJson.arguments || {},
+									};
+									blocks.push(toolBlock);
+									stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
+									stream.push({
+										type: "toolcall_delta",
+										contentIndex: blockIndex(),
+										delta: JSON.stringify(bareJson.arguments || {}),
+										partial: output,
+									});
+									stream.push({
+										type: "toolcall_end",
+										contentIndex: blockIndex(),
+										toolCall: toolBlock,
+										partial: output,
+									});
+									output.stopReason = "toolUse";
+								}
+							}
+						} catch {
+							/* not valid JSON, fall through */
+						}
+					}
+
+					if (!bareJsonHandled) {
+						// Strip any leaked markers and emit as plain text
+						const cleaned = _viaPromptBuffer.replace(/\[\/?(TOOL_CALL|TOOL_RESULT|TOOL_RESPONSE)\]/g, "").trim();
+						const fallback = cleaned || _viaPromptBuffer;
+						const textBlock: TextContent = { type: "text", text: fallback };
+						blocks.push(textBlock);
+						stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
+						stream.push({ type: "text_delta", contentIndex: blockIndex(), delta: fallback, partial: output });
+						stream.push({ type: "text_end", contentIndex: blockIndex(), content: fallback, partial: output });
+					}
+				}
+			}
+
+			// If all tool calls were converted to __text_response, fix stopReason
+			if (output.stopReason === "toolUse" && !output.content.some((b) => b.type === "toolCall")) {
+				output.stopReason = "stop";
+			}
 
 			if (options?.signal?.aborted) {
 				throw new Error("Request was aborted");
@@ -436,6 +669,64 @@ function buildParams(model: Model<"openai-completions">, context: Context, optio
 
 	if (options?.toolChoice) {
 		params.tool_choice = options.toolChoice;
+	} else if (compat.forceToolChoice && params.tools && params.tools.length > 0) {
+		// For models that don't autonomously choose tools (e.g. Foundry Local / Phi-4),
+		// force tool_choice=required and add a __text_response escape-hatch tool
+		// so the model can respond with text when no real tool is appropriate.
+		// Only force on first turn (user message), not after tool results — otherwise
+		// the model loops instead of delivering its answer as text.
+		const lastMsg = context.messages[context.messages.length - 1];
+		const isAfterToolResult = lastMsg && lastMsg.role === "toolResult";
+		params.tools.unshift({
+			type: "function",
+			function: {
+				name: "__text_response",
+				description:
+					"ALWAYS use this tool to respond with plain text. Use for greetings, conversation, opinions, questions, explanations - anything not requiring other tools.",
+				parameters: {
+					type: "object",
+					properties: {
+						text: { type: "string", description: "Your complete text response to the user" },
+					},
+					required: ["text"],
+				},
+				strict: false,
+			},
+		});
+		if (!isAfterToolResult) {
+			params.tool_choice = "required";
+		}
+	}
+
+	// toolsViaPrompt: for models without native tool calling (e.g. Phi Silica),
+	// inject format instructions into the system prompt and parse [TOOL_CALL] markers from output.
+	if (compat.toolsViaPrompt && context.tools && context.tools.length > 0) {
+		// Replace the bulky system prompt with a compact version.
+		// Phi Silica loses the [TOOL_CALL] format when the system prompt exceeds ~5K chars.
+		// Curated 4 tools with explicit descriptions to prevent wrong-tool selection.
+		const compactPrompt =
+			"You are Phi, a helpful AI assistant. You have these tools:\n\n" +
+			"- read(path): VIEW or READ an existing file\n" +
+			"- write(path, content): CREATE or SAVE a NEW file with content\n" +
+			"- edit(filePath, old_string, new_string): MODIFY part of an existing file\n" +
+			'- exec(command): RUN a shell command. Only needs "command" param.\n' +
+			"- __text_response(text): Reply with plain text when no tool is needed\n\n" +
+			"RULES:\n" +
+			'- Use "write" to CREATE files (needs path + content). Use "read" to VIEW files.\n' +
+			'- For "exec", ONLY provide "command". Do NOT add env, workdir, or other params.\n' +
+			'- ONLY use "write" tool when a FILE PATH is specified. For "write a poem/haiku/story", use __text_response.\n\n' +
+			"ALWAYS use this EXACT format:\n" +
+			'[TOOL_CALL]\n{"name": "TOOL_NAME", "arguments": {"param": "value"}}\n[/TOOL_CALL]\n\n' +
+			"Examples:\n" +
+			'[TOOL_CALL]\n{"name": "read", "arguments": {"path": "/file.txt"}}\n[/TOOL_CALL]\n\n' +
+			'[TOOL_CALL]\n{"name": "write", "arguments": {"path": "/hello.txt", "content": "Hello world"}}\n[/TOOL_CALL]\n\n' +
+			'[TOOL_CALL]\n{"name": "exec", "arguments": {"command": "echo hello"}}\n[/TOOL_CALL]\n\n' +
+			'[TOOL_CALL]\n{"name": "__text_response", "arguments": {"text": "Here is my answer."}}\n[/TOOL_CALL]';
+		if (messages.length > 0 && (messages[0].role === "system" || messages[0].role === "developer")) {
+			messages[0].content = compactPrompt;
+		}
+		delete (params as any).tools;
+		delete (params as any).tool_choice;
 	}
 
 	if (compat.thinkingFormat === "zai" && model.reasoning) {
@@ -538,9 +829,25 @@ export function convertMessages(
 		params.push({ role: role, content: sanitizeSurrogates(context.systemPrompt) });
 	}
 
+	// toolsViaPrompt: stateless turns to prevent coherence loss on small models.
+	// Phi Silica (3.8B) loses the [TOOL_CALL] format after ~3 turns with history.
+	// Stateless approach: only send the current turn's messages (last user message +
+	// any tool call/result from the current turn). This gives 8/8 turn accuracy vs
+	// 2/8 with full history. Trade-off: no conversation memory between turns.
+	let _historyStartIdx = 0;
+	if (compat.toolsViaPrompt) {
+		// Find the last user message — start from there (includes current tool interaction)
+		for (let k = transformedMessages.length - 1; k >= 0; k--) {
+			if (transformedMessages[k].role === "user") {
+				_historyStartIdx = k;
+				break;
+			}
+		}
+	}
+
 	let lastRole: string | null = null;
 
-	for (let i = 0; i < transformedMessages.length; i++) {
+	for (let i = _historyStartIdx; i < transformedMessages.length; i++) {
 		const msg = transformedMessages[i];
 		// Some providers (e.g. Mistral/Devstral) don't allow user messages directly after tool results
 		// Insert a synthetic assistant message to bridge the gap
@@ -552,17 +859,22 @@ export function convertMessages(
 		}
 
 		if (msg.role === "user") {
+			// toolsViaPrompt: strip [message_id: ...] suffixes that TUI/gateway appends.
+			// The square brackets confuse prompt-based models about what constitutes a marker.
+			const _stripMsgId = (text: string): string =>
+				compat.toolsViaPrompt ? text.replace(/\n?\[message_id: [^\]]+\]/g, "").trim() : text;
+
 			if (typeof msg.content === "string") {
 				params.push({
 					role: "user",
-					content: sanitizeSurrogates(msg.content),
+					content: _stripMsgId(sanitizeSurrogates(msg.content)),
 				});
 			} else {
 				const content: ChatCompletionContentPart[] = msg.content.map((item): ChatCompletionContentPart => {
 					if (item.type === "text") {
 						return {
 							type: "text",
-							text: sanitizeSurrogates(item.text),
+							text: _stripMsgId(sanitizeSurrogates(item.text)),
 						} satisfies ChatCompletionContentPartText;
 					} else {
 						return {
@@ -629,28 +941,45 @@ export function convertMessages(
 
 			const toolCalls = msg.content.filter((b) => b.type === "toolCall") as ToolCall[];
 			if (toolCalls.length > 0) {
-				assistantMsg.tool_calls = toolCalls.map((tc) => ({
-					id: tc.id,
-					type: "function" as const,
-					function: {
-						name: tc.name,
-						arguments: JSON.stringify(tc.arguments),
-					},
-				}));
-				const reasoningDetails = toolCalls
-					.filter((tc) => tc.thoughtSignature)
-					.map((tc) => {
-						try {
-							return JSON.parse(tc.thoughtSignature!);
-						} catch {
-							return null;
-						}
-					})
-					.filter(Boolean);
-				if (reasoningDetails.length > 0) {
-					(assistantMsg as any).reasoning_details = reasoningDetails;
+				if (compat.toolsViaPrompt) {
+					// Convert tool calls to text format for prompt-based models
+					const tc = toolCalls[0];
+					const toolCallText = `[TOOL_CALL]\n${JSON.stringify({ name: tc.name, arguments: tc.arguments })}\n[/TOOL_CALL]`;
+					assistantMsg.content = toolCallText;
+				} else {
+					assistantMsg.tool_calls = toolCalls.map((tc) => ({
+						id: tc.id,
+						type: "function" as const,
+						function: {
+							name: tc.name,
+							arguments: JSON.stringify(tc.arguments),
+						},
+					}));
+					const reasoningDetails = toolCalls
+						.filter((tc) => tc.thoughtSignature)
+						.map((tc) => {
+							try {
+								return JSON.parse(tc.thoughtSignature!);
+							} catch {
+								return null;
+							}
+						})
+						.filter(Boolean);
+					if (reasoningDetails.length > 0) {
+						(assistantMsg as any).reasoning_details = reasoningDetails;
+					}
 				}
 			}
+
+			// toolsViaPrompt: wrap plain text assistant responses in [TOOL_CALL] format
+			// for conversation history. This ensures the model always sees the expected
+			// format in prior turns, preventing format drift where the model stops using
+			// [TOOL_CALL] after seeing plain text responses from itself.
+			if (compat.toolsViaPrompt && toolCalls.length === 0 && nonEmptyTextBlocks.length > 0) {
+				const text = nonEmptyTextBlocks.map((b) => sanitizeSurrogates(b.text)).join("\n");
+				assistantMsg.content = `[TOOL_CALL]\n${JSON.stringify({ name: "__text_response", arguments: { text } })}\n[/TOOL_CALL]`;
+			}
+
 			// Skip assistant messages that have no content and no tool calls.
 			// Mistral explicitly requires "either content or tool_calls, but not none".
 			// Other providers also don't accept empty assistant messages.
@@ -665,6 +994,27 @@ export function convertMessages(
 			}
 			params.push(assistantMsg);
 		} else if (msg.role === "toolResult") {
+			if (compat.toolsViaPrompt) {
+				// Convert tool results to user messages for prompt-based models
+				let j = i;
+				for (; j < transformedMessages.length && transformedMessages[j].role === "toolResult"; j++) {
+					const toolMsg = transformedMessages[j] as ToolResultMessage;
+					const textResult = toolMsg.content
+						.filter((c) => c.type === "text")
+						.map((c) => (c as any).text)
+						.join("\n");
+					params.push({
+						role: "user",
+						content: sanitizeSurrogates(
+							`[TOOL_RESULT]\n${JSON.stringify({ name: toolMsg.toolName, result: textResult })}\n[/TOOL_RESULT]\n\nBased on the tool result, respond using [TOOL_CALL] with __text_response.`,
+						),
+					});
+				}
+				i = j - 1;
+				lastRole = "user";
+				continue;
+			}
+
 			const imageBlocks: Array<{ type: "image_url"; image_url: { url: string } }> = [];
 			let j = i;
 
@@ -803,6 +1153,9 @@ function detectCompat(model: Model<"openai-completions">): Required<OpenAIComple
 
 	const isMistral = provider === "mistral" || baseUrl.includes("mistral.ai");
 
+	const isFoundryLocal = baseUrl.includes("localhost:5272");
+	const isPhiSilica = isFoundryLocal && model.id.toLowerCase() === "phi-silica";
+
 	return {
 		supportsStore: !isNonStandard,
 		supportsDeveloperRole: !isNonStandard,
@@ -817,6 +1170,8 @@ function detectCompat(model: Model<"openai-completions">): Required<OpenAIComple
 		openRouterRouting: {},
 		vercelGatewayRouting: {},
 		supportsStrictMode: true,
+		forceToolChoice: isFoundryLocal && !isPhiSilica,
+		toolsViaPrompt: isPhiSilica,
 	};
 }
 
@@ -843,5 +1198,7 @@ function getCompat(model: Model<"openai-completions">): Required<OpenAICompletio
 		openRouterRouting: model.compat.openRouterRouting ?? {},
 		vercelGatewayRouting: model.compat.vercelGatewayRouting ?? detected.vercelGatewayRouting,
 		supportsStrictMode: model.compat.supportsStrictMode ?? detected.supportsStrictMode,
+		forceToolChoice: model.compat.forceToolChoice ?? detected.forceToolChoice,
+		toolsViaPrompt: model.compat.toolsViaPrompt ?? detected.toolsViaPrompt,
 	};
 }

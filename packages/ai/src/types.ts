@@ -237,6 +237,10 @@ export interface OpenAICompletionsCompat {
 	vercelGatewayRouting?: VercelGatewayRouting;
 	/** Whether the provider supports the `strict` field in tool definitions. Default: true. */
 	supportsStrictMode?: boolean;
+	/** Whether to force tool_choice="required" and inject a __text_response escape-hatch tool. Auto-detected for Foundry Local (non-Phi-Silica models). */
+	forceToolChoice?: boolean;
+	/** Whether to use prompt-based tool calling with [TOOL_CALL] markers instead of the native tool API. Auto-detected for Phi Silica on Foundry Local. */
+	toolsViaPrompt?: boolean;
 }
 
 /** Compatibility settings for OpenAI Responses APIs. */
