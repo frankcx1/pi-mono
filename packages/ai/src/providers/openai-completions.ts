@@ -537,6 +537,14 @@ export const streamOpenAICompletions: StreamFunction<"openai-completions", OpenA
 				throw new Error("An unknown error occurred");
 			}
 
+			// toolsViaPrompt: small delay before done event to allow TUI to process
+			// post-stream text events before the run completes. Without this, the
+			// done event and text events arrive in the same tick and the TUI clears
+			// state before rendering the text.
+			if (_isToolsViaPrompt && _viaPromptBuffer.length > 0) {
+				await new Promise((resolve) => setTimeout(resolve, 150));
+			}
+
 			stream.push({ type: "done", reason: output.stopReason, message: output });
 			stream.end();
 		} catch (error) {
