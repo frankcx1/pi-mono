@@ -35,7 +35,7 @@ solve any obstacles."
 
 - **Platformer:** ["Maybe someday you'll have a genie in your laptop. Today is not that day."](https://www.platformer.news/moltbot-clawdbot-review-ai-agent/)
   -- A more skeptical review. Casey Newton found a gap between the hype (YouTube
-  creators promising "24/7 AI employees") and reality. Her attempt to build a
+  creators promising "24/7 AI employees") and reality. His attempt to build a
   personalized morning briefing ultimately failed, leading her to uninstall it.
   An important reminder that this technology is still early.
 
